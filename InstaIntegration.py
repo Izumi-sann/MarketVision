@@ -12,6 +12,7 @@ import instaloader
 import requests
 import json
 import re
+import time
 
 
 @dataclass
@@ -43,6 +44,31 @@ def _classify_post(post: Any) -> str:
         return "video"
 
     return "photo"
+
+
+def _extract_views(node: dict[str, Any]) -> int | None:
+    for key in ("video_view_count", "video_play_count", "play_count", "view_count"):
+        value = node.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except Exception:
+                continue
+
+    # Some carousel posts can contain a video child with its own view counter.
+    children = node.get("edge_sidecar_to_children", {}).get("edges", [])
+    for child in children:
+        child_node = child.get("node", {})
+        if child_node.get("is_video"):
+            for key in ("video_view_count", "video_play_count", "play_count", "view_count"):
+                value = child_node.get(key)
+                if value is not None:
+                    try:
+                        return int(value)
+                    except Exception:
+                        continue
+
+    return None
 
 
 def fetch_public_profile_posts(
@@ -98,6 +124,14 @@ def fetch_public_profile_posts(
                     raise ValueError(f"Login error: {exc}")
             # else: no password provided — continue unauthenticated
 
+    http_session = requests.Session()
+    try:
+        for cookie in loader.context._session.cookies:
+            http_session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+    except Exception:
+        # If cookie transfer fails, keep an empty session and rely on unauthenticated fallbacks.
+        pass
+
     records: list[PostRecord] = []
 
     # First try with Instaloader (preferred)
@@ -129,7 +163,7 @@ def fetch_public_profile_posts(
     # HTML fallback: fetch the profile page and parse shared JSON data
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
-        resp = requests.get(f"https://www.instagram.com/{username}/", headers=headers, timeout=15)
+        resp = http_session.get(f"https://www.instagram.com/{username}/", headers=headers, timeout=15)
         resp.raise_for_status()
         text = resp.text
 
@@ -202,36 +236,53 @@ def fetch_public_profile_posts(
     # API-like fallback: use the web_profile_info endpoint with x-ig-app-id header
     try:
         api_headers = {"User-Agent": "Mozilla/5.0", "x-ig-app-id": "936619743392459"}
-        api_resp = requests.get(f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}", headers=api_headers, timeout=15)
-        if api_resp.status_code == 200:
-            j = api_resp.json()
-            user = j.get("data", {}).get("user") or j.get("user")
-            if user:
-                edges = user.get("edge_owner_to_timeline_media", {}).get("edges", [])
-                for edge in edges[:max_posts]:
-                    node = edge.get("node", {})
-                    shortcode = node.get("shortcode")
-                    is_video = node.get("is_video", False)
-                    ts = node.get("taken_at_timestamp")
-                    posted_at = datetime.utcfromtimestamp(int(ts)) if ts else datetime.utcnow()
-                    likes = node.get("edge_liked_by", {}).get("count") or node.get("edge_media_preview_like", {}).get("count") or 0
-                    comments = node.get("edge_media_to_comment", {}).get("count") or 0
-                    records.append(
-                        PostRecord(
-                            username=username,
-                            shortcode=shortcode,
-                            post_url=f"https://www.instagram.com/p/{shortcode}/" if shortcode else f"https://www.instagram.com/{username}/",
-                            post_type=("video" if is_video else "photo"),
-                            posted_at=posted_at,
-                            likes=int(likes or 0),
-                            comments=int(comments or 0),
-                            views=(int(node.get("video_view_count")) if is_video and node.get("video_view_count") is not None else None),
-                            caption=(node.get("edge_media_to_caption", {}).get("edges", [])[0].get("node", {}).get("text") if node.get("edge_media_to_caption", {}).get("edges") else None),
+        for attempt in range(3):
+            api_resp = http_session.get(
+                f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+                headers=api_headers,
+                timeout=15,
+            )
+            if api_resp.status_code == 200:
+                j = api_resp.json()
+                user = j.get("data", {}).get("user") or j.get("user")
+                if user:
+                    edges = user.get("edge_owner_to_timeline_media", {}).get("edges", [])
+                    for edge in edges[:max_posts]:
+                        node = edge.get("node", {})
+                        shortcode = node.get("shortcode")
+                        is_video = node.get("is_video", False)
+                        ts = node.get("taken_at_timestamp")
+                        posted_at = datetime.utcfromtimestamp(int(ts)) if ts else datetime.utcnow()
+                        likes = node.get("edge_liked_by", {}).get("count") or node.get("edge_media_preview_like", {}).get("count") or 0
+                        comments = node.get("edge_media_to_comment", {}).get("count") or 0
+                        records.append(
+                            PostRecord(
+                                username=username,
+                                shortcode=shortcode,
+                                post_url=f"https://www.instagram.com/p/{shortcode}/" if shortcode else f"https://www.instagram.com/{username}/",
+                                post_type=("video" if is_video else "photo"),
+                                posted_at=posted_at,
+                                likes=int(likes or 0),
+                                comments=int(comments or 0),
+                                views=(int(node.get("video_view_count")) if is_video and node.get("video_view_count") is not None else None),
+                                caption=(node.get("edge_media_to_caption", {}).get("edges", [])[0].get("node", {}).get("text") if node.get("edge_media_to_caption", {}).get("edges") else None),
+                            )
                         )
-                    )
 
-                if records:
-                    return records
+                    if records:
+                        return records
+
+            try:
+                payload = api_resp.json()
+            except Exception:
+                payload = {}
+
+            message = str(payload.get("message", "")).lower()
+            status = str(payload.get("status", "")).lower()
+            retryable = api_resp.status_code in {401, 403, 429} or "please wait" in message or status == "fail"
+            if not retryable:
+                break
+            time.sleep(0.75 * (attempt + 1))
     except Exception:
         pass
     # Playwright fallback: render the page and extract post links + timestamps
@@ -330,6 +381,8 @@ def summarize_posts(posts: list[PostRecord]) -> dict[str, Any]:
             "avg_likes": None,
             "avg_comments": None,
             "avg_views": None,
+            "video_posts": 0,
+            "views_coverage_pct": None,
             "type_counts": {},
         }
 
@@ -344,11 +397,14 @@ def summarize_posts(posts: list[PostRecord]) -> dict[str, Any]:
     total_comments = 0
     total_views = 0
     views_count = 0
+    video_posts = 0
 
     for post in posts:
         type_counts[post.post_type] = type_counts.get(post.post_type, 0) + 1
         total_likes += post.likes
         total_comments += post.comments
+        if post.post_type in {"video", "reel"}:
+            video_posts += 1
         if post.views is not None:
             total_views += post.views
             views_count += 1
@@ -360,6 +416,8 @@ def summarize_posts(posts: list[PostRecord]) -> dict[str, Any]:
         "avg_likes": round(total_likes / len(posts), 2),
         "avg_comments": round(total_comments / len(posts), 2),
         "avg_views": round(total_views / views_count, 2) if views_count else None,
+        "video_posts": video_posts,
+        "views_coverage_pct": round((views_count / video_posts) * 100, 2) if video_posts else None,
         "type_counts": type_counts,
     }
 

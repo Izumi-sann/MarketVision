@@ -75,7 +75,7 @@ with st.sidebar:
     st.header("Configurazione")
     usernames_input = st.text_area(
         "Profili Instagram da analizzare",
-        value="nike\nadidas\napple",
+        value="nike\nadidas",
         height=120,
         help="Inserisci uno username per riga oppure separato da virgole.",
     )
@@ -168,6 +168,12 @@ for profile in profiles:
 
             if summary["avg_views"] is not None:
                 st.metric("Views medie sui post video", summary["avg_views"])
+            if summary.get("views_coverage_pct") is not None:
+                st.metric(
+                    "Copertura views video",
+                    f"{summary['views_coverage_pct']}%",
+                    help="Quota di post video per cui Instagram espone un conteggio views leggibile.",
+                )
 
         except Exception as exc:
             st.error(f"Impossibile caricare @{profile}: {exc}")
@@ -175,6 +181,35 @@ for profile in profiles:
 if all_tables:
     combined = pd.concat(all_tables, ignore_index=True)
     combined["posted_at"] = pd.to_datetime(combined["posted_at"])
+
+    # Feature engineering for cross-format comparison.
+    combined["post_kind"] = combined["post_type"].replace({
+        "carousel": "foto",
+        "photo": "foto",
+        "video": "video",
+        "reel": "video",
+    })
+
+    def _zscore(series: pd.Series) -> pd.Series:
+        series = pd.to_numeric(series, errors="coerce")
+        std = series.std(ddof=0)
+        if pd.isna(std) or std == 0:
+            return pd.Series([0.0] * len(series), index=series.index)
+        return (series - series.mean()) / std
+
+    combined["z_likes"] = _zscore(combined["likes"])
+    combined["z_comments"] = _zscore(combined["comments"])
+    combined["z_views"] = pd.NA
+    video_mask = combined["views"].notna() & (combined["views"] > 0)
+    if video_mask.any():
+        combined.loc[video_mask, "z_views"] = _zscore(combined.loc[video_mask, "views"])
+
+    # Common score for photo/video comparison: only metrics shared by both formats.
+    combined["common_appreciation_score"] = (combined["z_likes"] + combined["z_comments"]) / 2
+    # Video-specific reach signal, kept separate from the cross-format score.
+    combined["video_reach_score"] = combined["z_views"]
+    combined["engagement_score"] = (combined["z_likes"] + combined["z_comments"]) / 2
+    combined["comment_to_like_ratio"] = combined["comments"] / combined["likes"].replace(0, pd.NA)
 
     st.markdown("### Confronto tra profili")
     summary_rows = []
@@ -203,6 +238,92 @@ if all_tables:
         )
         fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig, width='stretch')
+
+    st.markdown("### Foto vs Video: indice normalizzato")
+    kind_summary = (
+        combined.groupby("post_kind", dropna=False)
+        .agg(
+            post_count=("post_kind", "size"),
+            score_media=("common_appreciation_score", "mean"),
+            score_mediana=("common_appreciation_score", "median"),
+            z_like_media=("z_likes", "mean"),
+            z_commenti_media=("z_comments", "mean"),
+            z_views_media=("video_reach_score", "mean"),
+            like_medi=("likes", "mean"),
+            commenti_medi=("comments", "mean"),
+            views_medi=("views", "mean"),
+        )
+        .reset_index()
+        .sort_values("post_kind")
+    )
+
+    kind_col1, kind_col2 = st.columns([1.1, 0.9])
+    with kind_col1:
+        st.dataframe(kind_summary, width='stretch', hide_index=True)
+    with kind_col2:
+        fig = px.bar(
+            kind_summary,
+            x="post_kind",
+            y="score_media",
+            color="post_kind",
+            title="Indice normalizzato medio per tipo post",
+            text_auto=True,
+        )
+        fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10), showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+
+    st.markdown("#### Distribuzione punteggi normalizzati")
+    dist_fig = px.violin(
+        combined,
+        x="post_kind",
+        y="common_appreciation_score",
+        box=True,
+        points="all",
+        color="post_kind",
+        title="Foto vs video: distribuzione dell'indice comune normalizzato",
+    )
+    dist_fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10), showlegend=False)
+    st.plotly_chart(dist_fig, width='stretch')
+
+    st.markdown("#### Andamento nel tempo dell'indice comune")
+    timeline_frames = []
+    for kind, group in combined.sort_values("posted_at").groupby("post_kind", dropna=False):
+        group = group.copy()
+        group["score_roll"] = group["common_appreciation_score"].rolling(window=min(5, len(group)), min_periods=1).mean()
+        timeline_frames.append(group)
+    timeline_df = pd.concat(timeline_frames, ignore_index=True) if timeline_frames else combined.copy()
+    line_fig = px.line(
+        timeline_df,
+        x="posted_at",
+        y="score_roll",
+        color="post_kind",
+        markers=True,
+        title="Trend dell'indice normalizzato nel tempo",
+    )
+    line_fig.update_layout(height=380, margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(line_fig, width='stretch')
+
+    st.markdown("#### Top post per indice comune normalizzato")
+    top_posts = combined.sort_values("common_appreciation_score", ascending=False)[
+        ["account", "post_kind", "posted_at", "likes", "comments", "views", "common_appreciation_score", "video_reach_score", "post_url"]
+    ].head(10)
+    top_posts = top_posts.rename(
+        columns={
+            "post_kind": "tipo",
+            "posted_at": "data",
+            "likes": "like",
+            "comments": "commenti",
+            "views": "views",
+            "common_appreciation_score": "indice_comune",
+            "video_reach_score": "reach_video",
+            "post_url": "link",
+        }
+    )
+    st.dataframe(top_posts, width='stretch', hide_index=True)
+
+    st.caption(
+        "L'indice comune usa solo like e commenti, quindi foto e video sono confrontabili. Le views restano separate come segnale di reach solo per i video."
+    )
 
 st.markdown("---")
 st.markdown("### Insights account proprietario")
