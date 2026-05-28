@@ -1,0 +1,10 @@
+# Ignore environment file with secrets
+.env
+
+# Database
+data/
+
+# Python cache and virtualenv
+__pycache__/
+.venv/
+venv/
