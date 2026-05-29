@@ -238,9 +238,8 @@ streamlit run app.py
 ## 13. Estensioni future
 - per-media insights ufficiali dalla Graph API;
 - confronto aggregato per settore o brand;
-- salvataggio storico più strutturato con timestamp e versioning;
-- esportazione CSV/Excel;
-- alert automatici su variazioni anomale dell'engagement.
+- salvataggio storico più strutturato;
+- aggiunta analisi intelligente del contenuto dei post e caption;
 
 ## 14. Note finali
 Il progetto è pensato come prototipo operativo: privilegia l'analisi rapida di profili pubblici e l'uso delle API ufficiali per l'account proprietario, con persistenza locale degli snapshot e una dashboard interattiva.
