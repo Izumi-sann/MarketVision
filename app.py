@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,6 +11,7 @@ import plotly.express as px
 import streamlit as st
 
 from InstaIntegration import (
+    PostRecord,
     fetch_official_insights,
     fetch_public_profile_posts,
     summarize_posts,
@@ -25,6 +27,27 @@ st.set_page_config(
 
 # Ensure database exists
 DB_PATH = db.init_db()
+
+
+def _rows_to_posts(rows: list[dict]) -> list[PostRecord]:
+    posts: list[PostRecord] = []
+    for row in rows:
+        posted_at_raw = row.get("posted_at")
+        posted_at = datetime.fromisoformat(posted_at_raw) if posted_at_raw else datetime.utcnow()
+        posts.append(
+            PostRecord(
+                username=row.get("account") or row.get("username") or "",
+                shortcode=row.get("shortcode") or "",
+                post_url=row.get("post_url") or "",
+                post_type=row.get("post_type") or "photo",
+                posted_at=posted_at,
+                likes=int(row.get("likes") or 0),
+                comments=int(row.get("comments") or 0),
+                views=(int(row["views"]) if row.get("views") is not None else None),
+                caption=row.get("caption"),
+            )
+        )
+    return posts
 
 st.markdown(
     """
@@ -102,81 +125,87 @@ for profile in profiles:
         st.subheader(f"@{profile}")
         try:
             posts = fetch_public_profile_posts(profile, max_posts=max_posts)
-            summary = summarize_posts(posts)
-            table = pd.DataFrame([item.to_dict() for item in posts])
-            table["posted_at"] = pd.to_datetime(table["posted_at"])
-            table["account"] = profile
-            all_tables.append(table)
-
-            try:
-                db.save_posts_snapshot(profile, posts, db_path=DB_PATH)
-            except Exception:
-                # non-blocking: if DB write fails, continue showing UI
-                st.warning("Attenzione: impossibile salvare lo snapshot nel DB locale.")
-
-            top_cols = st.columns(4)
-            top_cols[0].metric("Post caricati", summary["count"])
-            top_cols[1].metric("Frequenza media", f"{summary['avg_days_between_posts']} giorni" if summary["avg_days_between_posts"] is not None else "N/D")
-            top_cols[2].metric("Like medi", summary["avg_likes"])
-            top_cols[3].metric("Commenti medi", summary["avg_comments"])
-
-            chart_cols = st.columns([1, 1])
-            with chart_cols[0]:
-                type_df = pd.DataFrame(
-                    [{"tipo": key, "conteggio": value} for key, value in summary["type_counts"].items()]
-                )
-                if not type_df.empty:
-                    fig = px.bar(
-                        type_df,
-                        x="tipo",
-                        y="conteggio",
-                        color="tipo",
-                        title="Distribuzione tipi post",
-                    )
-                    fig.update_layout(height=330, margin=dict(l=10, r=10, t=50, b=10), showlegend=False)
-                    st.plotly_chart(fig, width='stretch')
-                else:
-                    st.caption("Nessun dato sui tipi post disponibile.")
-
-            with chart_cols[1]:
-                engagement_df = table.sort_values("posted_at")[["posted_at", "likes", "comments"]]
-                melted = engagement_df.melt(id_vars="posted_at", var_name="metrica", value_name="valore")
-                fig = px.line(
-                    melted,
-                    x="posted_at",
-                    y="valore",
-                    color="metrica",
-                    markers=True,
-                    title="Like e commenti sugli ultimi post",
-                )
-                fig.update_layout(height=330, margin=dict(l=10, r=10, t=50, b=10))
-                st.plotly_chart(fig, width='stretch')
-
-            st.markdown("#### Ultimi post")
-            display_table = table[["posted_at", "post_type", "likes", "comments", "views", "post_url"]].copy()
-            display_table = display_table.rename(
-                columns={
-                    "posted_at": "data",
-                    "post_type": "tipo",
-                    "likes": "like",
-                    "comments": "commenti",
-                    "views": "views",
-                    "post_url": "link",
-                }
-            )
-            st.dataframe(display_table, width='stretch', hide_index=True)
-
-            if summary["avg_views"] is not None:
-                st.metric("Views medie sui post video", summary["avg_views"])
-            if summary.get("views_coverage_pct") is not None:
-                st.metric(
-                    "Copertura views video",
-                    f"{summary['views_coverage_pct']}%",
-                    help="Quota di post video per cui Instagram espone un conteggio views leggibile.",
-                )
-
         except Exception as exc:
-            st.error(f"Impossibile caricare @{profile}: {exc}")
+            cached_rows = db.fetch_snapshots(profile, db_path=DB_PATH)
+            if not cached_rows:
+                st.error(f"Impossibile caricare @{profile}: {exc}")
+                continue
+
+            posts = _rows_to_posts(cached_rows)
+            st.warning(f"Caricamento live non disponibile per @{profile}: {exc}. Uso l'ultimo snapshot locale.")
+
+        summary = summarize_posts(posts)
+        table = pd.DataFrame([item.to_dict() for item in posts])
+        table["posted_at"] = pd.to_datetime(table["posted_at"])
+        table["account"] = profile
+        all_tables.append(table)
+
+        try:
+            db.save_posts_snapshot(profile, posts, db_path=DB_PATH)
+        except Exception:
+            # non-blocking: if DB write fails, continue showing UI
+            st.warning("Attenzione: impossibile salvare lo snapshot nel DB locale.")
+
+        top_cols = st.columns(4)
+        top_cols[0].metric("Post caricati", summary["count"])
+        top_cols[1].metric("Frequenza media", f"{summary['avg_days_between_posts']} giorni" if summary["avg_days_between_posts"] is not None else "N/D")
+        top_cols[2].metric("Like medi", summary["avg_likes"])
+        top_cols[3].metric("Commenti medi", summary["avg_comments"])
+
+        chart_cols = st.columns([1, 1])
+        with chart_cols[0]:
+            type_df = pd.DataFrame(
+                [{"tipo": key, "conteggio": value} for key, value in summary["type_counts"].items()]
+            )
+            if not type_df.empty:
+                fig = px.bar(
+                    type_df,
+                    x="tipo",
+                    y="conteggio",
+                    color="tipo",
+                    title="Distribuzione tipi post",
+                )
+                fig.update_layout(height=330, margin=dict(l=10, r=10, t=50, b=10), showlegend=False)
+                st.plotly_chart(fig, width='stretch')
+            else:
+                st.caption("Nessun dato sui tipi post disponibile.")
+
+        with chart_cols[1]:
+            engagement_df = table.sort_values("posted_at")[["posted_at", "likes", "comments"]]
+            melted = engagement_df.melt(id_vars="posted_at", var_name="metrica", value_name="valore")
+            fig = px.line(
+                melted,
+                x="posted_at",
+                y="valore",
+                color="metrica",
+                markers=True,
+                title="Like e commenti sugli ultimi post",
+            )
+            fig.update_layout(height=330, margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig, width='stretch')
+
+        st.markdown("#### Ultimi post")
+        display_table = table[["posted_at", "post_type", "likes", "comments", "views", "post_url"]].copy()
+        display_table = display_table.rename(
+            columns={
+                "posted_at": "data",
+                "post_type": "tipo",
+                "likes": "like",
+                "comments": "commenti",
+                "views": "views",
+                "post_url": "link",
+            }
+        )
+        st.dataframe(display_table, width='stretch', hide_index=True)
+
+        if summary["avg_views"] is not None:
+            st.metric("Views medie sui post video", summary["avg_views"])
+        if summary.get("views_coverage_pct") is not None:
+            st.metric(
+                "Copertura views video",
+                f"{summary['views_coverage_pct']}%",
+                help="Quota di post video per cui Instagram espone un conteggio views leggibile.",
+            )
 
 if all_tables:
     combined = pd.concat(all_tables, ignore_index=True)

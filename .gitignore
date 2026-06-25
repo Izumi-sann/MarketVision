@@ -8,3 +8,7 @@ data/
 __pycache__/
 .venv/
 venv/
+
+#session data
+.session-nsjs3948
+#nsjs3948
